@@ -25,7 +25,10 @@ from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 from dial_mpc.examples import examples
 from dial_mpc.core.dial_config import DialConfig
 
+from jax.experimental import checkify
+
 plt.style.use("science")
+plt.rcParams['text.usetex'] = False
 
 # Tell XLA to use Triton GEMM, this improves steps/sec by ~30% on some GPUs
 xla_flags = os.environ.get("XLA_FLAGS", "")
@@ -63,9 +66,12 @@ class MBDPI:
         A = sigma0
         B = jnp.log(sigma1 / sigma0) / args.Ndiffuse
         self.sigmas = A * jnp.exp(B * jnp.arange(args.Ndiffuse))
+        # self.sigmas = 0.1 * jnp.ones(args.Ndiffuse)
+
         self.sigma_control = (
             args.horizon_diffuse_factor ** jnp.arange(args.Hnode + 1)[::-1]
         )
+
 
         # node to u
         self.ctrl_dt = 0.02
@@ -99,34 +105,87 @@ class MBDPI:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def reverse_once(self, state, rng, Ybar_i, noise_scale):
+
+        '''
+        Ybar_i: Current knots (N_nodes x N_control)
+        State: Brax state
+        rng: Random number generator
+        noise_scale: sigma for isotropic noises (N_nodes)
+        '''
+        # jax.debug.print("Ybar_i:{}, noise_scale:{}", Ybar_i.shape, noise_scale.shape, ordered=True)
         # sample from q_i
         rng, Y0s_rng = jax.random.split(rng)
         eps_Y = jax.random.normal(
             Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
         )
-        Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
-        # we can't change the first control
-        Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
-        # append Y0s with Ybar_i to also evaluate Ybar_i
-        Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
-        Y0s = jnp.clip(Y0s, -1.0, 1.0)
-        # convert Y0s to us
-        us = self.node2u_vvmap(Y0s)
+        
+        Y0s = eps_Y * noise_scale[None, :, None] 
 
+        Y_ctrls = Y0s + Ybar_i
+
+        # we can't change the first control
+        # Y_ctrls = Y_ctrls.at[:, 0].set(Ybar_i[0, :])
+
+        # Transform back the clipped eps_Y
+        Y_ctrls_plus = jnp.clip(Y_ctrls, -1.0, 1.0)
+        Y0s = Y_ctrls - Ybar_i
+        eps_Y = Y0s / noise_scale[None, :, None]
+
+        # convert Y_ctrls to us
+        us = self.node2u_vvmap(Y_ctrls)
         # esitimate mu_0tm1
         rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+
+        Y0s = jnp.reshape(Y0s, (self.args.Nsample, (self.args.Hnode+1)*self.nu)) # N_sample x (N_nodes*Nu)
+
+        eps_Y = jnp.reshape(eps_Y, (self.args.Nsample, (self.args.Hnode+1)*self.nu)) 
+        # N_sample x (N_nodes*Nu)
+
         rew_Ybar_i = rewss[-1].mean()
         qss = pipeline_statess.q
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
-        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
-
+        logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
+        
         weights = jax.nn.softmax(logp0)
-        Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+        # Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+
+        gradient = (noise_scale[0]**-1) * jnp.einsum("n,nk->k", weights, eps_Y)
+        # deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
+        # hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
+            
+        # hessian = -(self.args.temp_sample) * hessian
+        gradient = -(self.args.temp_sample) * gradient
+        # Hessian based 
+        # hessian = 0.5 * (hessian + jnp.transpose(hessian))
+        
+        # eigenValues, U = jnp.linalg.eigh(hessian)
+        
+        # # jax.debug.print("hessian: {}", hessian)
+
+        # jax.debug.print("Eigenvalues: {}", eigenValues)
+
+        # eigenValues = jnp.clip(eigenValues, 1e-4, 1000)
+
+        # hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
+
+        # hess_inv = jnp.linalg.inv(hessian)
+
+        # jax.debug.print("inverse hessian: {}", hess_inv)
+
+        # direction = hess_inv @ gradient
+        # direction = 1e-4 * jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
+        # jax.debug.print("Hessian direction: {}", direction)
+
+        # Gradeint descent (MPPI)
+        direction = (1/self.args.temp_sample) * (noise_scale[0]**2) * jnp.reshape(gradient, (self.args.Hnode + 1, self.nu))
+        jax.debug.print("GD direction: {}", direction)
 
         # NOTE: update only with reward
-        Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
+        Ybar = Ybar_i - direction
+        Ybar = jnp.clip(Ybar, -1, 1)
+
         qbar = jnp.einsum("n,nij->ij", weights, qss)
         qdbar = jnp.einsum("n,nij->ij", weights, qdss)
         xbar = jnp.einsum("n,nijk->ijk", weights, xss)
@@ -136,10 +195,56 @@ class MBDPI:
             "qbar": qbar,
             "qdbar": qdbar,
             "xbar": xbar,
-            "new_noise_scale": new_noise_scale,
+            "new_noise_scale": noise_scale,
         }
 
         return rng, Ybar, info
+
+    # @functools.partial(jax.jit, static_argnums=(0,))
+    # def reverse_once(self, state, rng, Ybar_i, noise_scale):
+    #     # sample from q_i
+    #     rng, Y0s_rng = jax.random.split(rng)
+    #     eps_Y = jax.random.normal(
+    #         Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
+    #     )
+    #     Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
+    #     # we can't change the first control
+    #     Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
+    #     # append Y0s with Ybar_i to also evaluate Ybar_i
+    #     # Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
+    #     Y0s = jnp.clip(Y0s, -1.0, 1.0)
+    #     # convert Y0s to us
+    #     us = self.node2u_vvmap(Y0s)
+
+    #     # esitimate mu_0tm1
+    #     rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+    #     rew_Ybar_i = rewss[-1].mean()
+    #     qss = pipeline_statess.q
+    #     qdss = pipeline_statess.qd
+    #     xss = pipeline_statess.x.pos
+    #     rews = rewss.mean(axis=-1)
+    #     logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
+
+    #     # logp0 = (rews - rew_Ybar_i) / self.args.temp_sample
+        
+    #     weights = jax.nn.softmax(logp0)
+    #     Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+
+    #     # NOTE: update only with reward
+    #     Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
+    #     qbar = jnp.einsum("n,nij->ij", weights, qss)
+    #     qdbar = jnp.einsum("n,nij->ij", weights, qdss)
+    #     xbar = jnp.einsum("n,nijk->ijk", weights, xss)
+
+    #     info = {
+    #         "rews": rews,
+    #         "qbar": qbar,
+    #         "qdbar": qdbar,
+    #         "xbar": xbar,
+    #         "new_noise_scale": new_noise_scale,
+    #     }
+
+    #     return rng, Ybar, info
 
     def reverse(self, state, YN, rng):
         Yi = YN
@@ -253,9 +358,10 @@ def main():
                 print("Performing JIT on DIAL-MPC")
 
             t0 = time.time()
-            traj_diffuse_factors = (
+            traj_diffuse_factors =  0.5 * (
                 mbdpi.sigma_control * dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
             )
+
             (rng, Y0, _), info = jax.lax.scan(
                 reverse_scan, (rng, Y0, state), traj_diffuse_factors
             )
@@ -278,9 +384,9 @@ def main():
     timestamp = time.strftime("%Y%m%d-%H%M%S")
 
     # plot rews_plan
-    # plt.plot(rews_plan)
-    # plt.savefig(os.path.join(dial_config.output_dir,
-    #             f"{timestamp}_rews_plan.pdf"))
+    plt.plot(rews_plan)
+    plt.savefig(os.path.join(dial_config.output_dir,
+                f"{timestamp}_rews_plan.pdf"))
 
     # host webpage with flask
     print("Processing rollout for visualization")
