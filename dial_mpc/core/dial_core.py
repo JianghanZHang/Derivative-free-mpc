@@ -25,7 +25,7 @@ from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 from dial_mpc.examples import examples
 from dial_mpc.core.dial_config import DialConfig
 
-from jax.experimental import checkify
+from jaxopt import BFGS
 
 plt.style.use("science")
 plt.rcParams['text.usetex'] = False
@@ -34,6 +34,20 @@ plt.rcParams['text.usetex'] = False
 xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = xla_flags
+
+
+
+def solve_subproblem(g, H, sigma, p0=None, maxiter=1000):
+    def cubic_model(p, g, H, sigma):
+        quad = 0.5 * p @ (H @ p)
+        cubic = (sigma / 3.0) * (jnp.linalg.norm(p) ** 3)
+        return g @ p + quad + cubic
+
+    n = g.shape[0]
+    p0 = (jnp.zeros(n) + 1e-8)if p0 is None else p0         
+    solver = BFGS(fun=lambda p: cubic_model(p, g, H, sigma),
+                   maxiter=maxiter, tol=1e-6, jit=True)
+    return -solver.run(p0).params                    # returns -p★
 
 
 def rollout_us(step_env, state, us):
@@ -78,6 +92,9 @@ class MBDPI:
         self.step_us = jnp.linspace(0, self.ctrl_dt * args.Hsample, args.Hsample + 1)
         self.step_nodes = jnp.linspace(0, self.ctrl_dt * args.Hsample, args.Hnode + 1)
         self.node_dt = self.ctrl_dt * (args.Hsample) / (args.Hnode)
+
+        #cubic newton solver
+        self.solve_subproblem = jax.jit(solve_subproblem)
 
         # setup function
         self.rollout_us = jax.jit(functools.partial(rollout_us, self.env.step))
@@ -146,41 +163,41 @@ class MBDPI:
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
+
         logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
+        # logp0 = (rews) / self.args.temp_sample
+
         
         weights = jax.nn.softmax(logp0)
         # Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
 
         gradient = (noise_scale[0]**-1) * jnp.einsum("n,nk->k", weights, eps_Y)
-        # deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
-        # hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
+        deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
+        hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
             
-        # hessian = -(self.args.temp_sample) * hessian
+        hessian = -(self.args.temp_sample) * hessian
         gradient = -(self.args.temp_sample) * gradient
         # Hessian based 
-        # hessian = 0.5 * (hessian + jnp.transpose(hessian))
+        hessian = 0.5 * (hessian + jnp.transpose(hessian))
         
-        # eigenValues, U = jnp.linalg.eigh(hessian)
+        eigenValues, U = jnp.linalg.eigh(hessian)
         
-        # # jax.debug.print("hessian: {}", hessian)
-
         # jax.debug.print("Eigenvalues: {}", eigenValues)
 
-        # eigenValues = jnp.clip(eigenValues, 1e-4, 1000)
+        eigenValues = jnp.clip(eigenValues, -1, 1)
 
-        # hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
+        hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
 
-        # hess_inv = jnp.linalg.inv(hessian)
+        direction = self.solve_subproblem(gradient, hessian, sigma=0.3)
+        direction = jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
 
-        # jax.debug.print("inverse hessian: {}", hess_inv)
-
-        # direction = hess_inv @ gradient
-        # direction = 1e-4 * jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
         # jax.debug.print("Hessian direction: {}", direction)
 
+
         # Gradeint descent (MPPI)
-        direction = (1/self.args.temp_sample) * (noise_scale[0]**2) * jnp.reshape(gradient, (self.args.Hnode + 1, self.nu))
-        jax.debug.print("GD direction: {}", direction)
+        # direction = (1/self.args.temp_sample) * (noise_scale[0]**2) * jnp.reshape(gradient, (self.args.Hnode + 1, self.nu))
+        # jax.debug.print("GD direction: {}", direction)
+
 
         # NOTE: update only with reward
         Ybar = Ybar_i - direction
