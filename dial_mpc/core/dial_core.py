@@ -39,7 +39,7 @@ os.environ["XLA_FLAGS"] = xla_flags
 
 def solve_subproblem(g, H, sigma, p0=None, maxiter=1000):
     def cubic_model(p, g, H, sigma):
-        quad = 0.5 * p @ (H @ p)
+        quad = 1.0 * p @ (H @ p)
         cubic = (sigma / 3.0) * (jnp.linalg.norm(p) ** 3)
         return g @ p + quad + cubic
 
@@ -164,8 +164,8 @@ class MBDPI:
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
 
-        logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
-        # logp0 = (rews) / self.args.temp_sample
+        # logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
+        logp0 = (rews) / self.args.temp_sample
 
         
         weights = jax.nn.softmax(logp0)
@@ -174,7 +174,8 @@ class MBDPI:
         gradient = (noise_scale[0]**-1) * jnp.einsum("n,nk->k", weights, eps_Y)
         deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
         hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
-            
+        # hessian = gradient[:, None] @ jnp.transpose(gradient[:, None])
+
         hessian = -(self.args.temp_sample) * hessian
         gradient = -(self.args.temp_sample) * gradient
         # Hessian based 
@@ -184,11 +185,11 @@ class MBDPI:
         
         # jax.debug.print("Eigenvalues: {}", eigenValues)
 
-        eigenValues = jnp.clip(eigenValues, -1, 1)
+        eigenValues = jnp.clip(eigenValues, 1e-6, 10)
 
         hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
 
-        direction = self.solve_subproblem(gradient, hessian, sigma=0.3)
+        direction = self.solve_subproblem(gradient, hessian, sigma=1)
         direction = jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
 
         # jax.debug.print("Hessian direction: {}", direction)
@@ -375,7 +376,7 @@ def main():
                 print("Performing JIT on DIAL-MPC")
 
             t0 = time.time()
-            traj_diffuse_factors =  0.5 * (
+            traj_diffuse_factors =  0.05 * (
                 mbdpi.sigma_control * dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
             )
 
