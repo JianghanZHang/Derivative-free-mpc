@@ -40,7 +40,7 @@ os.environ["XLA_FLAGS"] = xla_flags
 def solve_subproblem(g, H, sigma, p0=None, maxiter=1000):
     def cubic_model(p, g, H, sigma):
         quad = 0.5 * p @ (H @ p)
-        cubic = (sigma / 3.0) * (jnp.linalg.norm(p) ** 3)
+        cubic = (sigma / 6.0) * (jnp.linalg.norm(p) ** 3)
         return g @ p + quad + cubic
 
     n = g.shape[0]
@@ -126,88 +126,134 @@ class MBDPI:
         nodes = spline(self.step_nodes)
         return nodes
 
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def reverse_once(self, state, rng, Ybar_i, noise_scale):
+
+        '''
+        Ybar_i: Current knots (N_nodes x N_control)
+        State: Brax state
+        rng: Random number generator
+        noise_scale: sigma for isotropic noises (N_nodes)
+        '''
+        # jax.debug.print("Ybar_i:{}, noise_scale:{}", Ybar_i.shape, noise_scale.shape, ordered=True)
+        # sample from q_i
+        rng, Y0s_rng = jax.random.split(rng)
+        eps_Y = jax.random.normal(
+            Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
+        )
+        
+        Y0s = eps_Y * noise_scale[None, :, None] 
+
+        Y_ctrls = Y0s + Ybar_i
+
+        # we can't change the first control
+        Y_ctrls = Y_ctrls.at[:, 0].set(Ybar_i[0, :])
+
+        # Transform back the clipped eps_Y
+        Y0s = Y_ctrls - Ybar_i
+        eps_Y = Y0s / noise_scale[None, :, None]
+
+        # convert Y_ctrls to us
+        us = self.node2u_vvmap(Y_ctrls)
+        # esitimate mu_0tm1
+        rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+
+        Y0s = jnp.reshape(Y0s, (self.args.Nsample, (self.args.Hnode+1)*self.nu)) # N_sample x (N_nodes*Nu)
+
+        eps_Y = jnp.reshape(eps_Y, (self.args.Nsample, (self.args.Hnode+1)*self.nu))  # N_sample x (N_nodes*Nu)
+
+        rew_Ybar_i = rewss[-1].mean()
+        qss = pipeline_statess.q
+        qdss = pipeline_statess.qd
+        xss = pipeline_statess.x.pos
+        rews = rewss.mean(axis=-1)
+
+        # logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
+        logp0 = (rews) / self.args.temp_sample
+
+        weights = jax.nn.softmax(logp0)
+        # Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+
+        gradient = (noise_scale[0]**-1) * jnp.einsum("n,nk->k", weights, eps_Y)
+        deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
+        hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
+
+        hessian = -(self.args.temp_sample) * hessian
+        gradient = -(self.args.temp_sample) * gradient
+        # Hessian based 
+        hessian = 0.5 * (hessian + jnp.transpose(hessian))
+        
+        eigenValues, U = jnp.linalg.eigh(hessian)
+        
+        # jax.debug.print("Eigenvalues: {}", eigenValues)
+
+        eigenValues = jnp.clip(eigenValues, 1e-6, 100)
+
+        hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
+
+        direction = self.solve_subproblem(gradient, hessian, sigma=0.1)
+        direction = jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
+
+        # jax.debug.print("Hessian direction: {}", direction)
+
+        # Gradeint descent (MPPI)
+        # direction = (1/self.args.temp_sample) * (noise_scale[0]**2) * jnp.reshape(gradient, (self.args.Hnode + 1, self.nu))
+        # jax.debug.print("GD direction: {}", direction)
+
+
+        # NOTE: update only with reward
+        Ybar = Ybar_i - direction
+        Ybar = jnp.clip(Ybar, -1, 1)
+        
+        qbar = qss[-1, :, :]
+        qdbar = qdss[-1, :, :]
+        xbar = xss[-1, :, :]
+        # qbar = jnp.einsum("n,nij->ij", weights, qss)
+        # qdbar = jnp.einsum("n,nij->ij", weights, qdss)
+        # xbar = jnp.einsum("n,nijk->ijk", weights, xss)
+
+        info = {
+            "rews": rews,
+            "qbar": qbar,
+            "qdbar": qdbar,
+            "xbar": xbar,
+            "new_noise_scale": noise_scale,
+        }
+
+        return rng, Ybar, info
+
     # @functools.partial(jax.jit, static_argnums=(0,))
     # def reverse_once(self, state, rng, Ybar_i, noise_scale):
-
-    #     '''
-    #     Ybar_i: Current knots (N_nodes x N_control)
-    #     State: Brax state
-    #     rng: Random number generator
-    #     noise_scale: sigma for isotropic noises (N_nodes)
-    #     '''
-    #     # jax.debug.print("Ybar_i:{}, noise_scale:{}", Ybar_i.shape, noise_scale.shape, ordered=True)
     #     # sample from q_i
     #     rng, Y0s_rng = jax.random.split(rng)
     #     eps_Y = jax.random.normal(
     #         Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
     #     )
-        
-    #     Y0s = eps_Y * noise_scale[None, :, None] 
-
-    #     Y_ctrls = Y0s + Ybar_i
-
+    #     Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
     #     # we can't change the first control
-    #     # Y_ctrls = Y_ctrls.at[:, 0].set(Ybar_i[0, :])
+    #     Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
+    #     # append Y0s with Ybar_i to also evaluate Ybar_i
+    #     Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
+    #     Y0s = jnp.clip(Y0s, -1.0, 1.0)
+    #     # convert Y0s to us
+    #     us = self.node2u_vvmap(Y0s)
 
-    #     # Transform back the clipped eps_Y
-    #     Y_ctrls_plus = jnp.clip(Y_ctrls, -1.0, 1.0)
-    #     Y0s = Y_ctrls - Ybar_i
-    #     eps_Y = Y0s / noise_scale[None, :, None]
-
-    #     # convert Y_ctrls to us
-    #     us = self.node2u_vvmap(Y_ctrls)
     #     # esitimate mu_0tm1
     #     rewss, pipeline_statess = self.rollout_us_vmap(state, us)
-
-    #     Y0s = jnp.reshape(Y0s, (self.args.Nsample, (self.args.Hnode+1)*self.nu)) # N_sample x (N_nodes*Nu)
-
-    #     eps_Y = jnp.reshape(eps_Y, (self.args.Nsample, (self.args.Hnode+1)*self.nu)) 
-    #     # N_sample x (N_nodes*Nu)
-
     #     rew_Ybar_i = rewss[-1].mean()
     #     qss = pipeline_statess.q
     #     qdss = pipeline_statess.qd
     #     xss = pipeline_statess.x.pos
     #     rews = rewss.mean(axis=-1)
+    #     logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
 
-    #     # logp0 = (rews) / rews.std(axis=-1) / self.args.temp_sample
-    #     logp0 = (rews) / self.args.temp_sample
-
+    #     # logp0 = (rews - rew_Ybar_i) / self.args.temp_sample
+        
     #     weights = jax.nn.softmax(logp0)
-    #     # Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
-
-    #     gradient = (noise_scale[0]**-1) * jnp.einsum("n,nk->k", weights, eps_Y)
-    #     deltas = eps_Y[:, :, None] * eps_Y[:, None, :] - jnp.eye((self.args.Hnode+1)*self.nu)
-    #     hessian = (noise_scale[0]**-2) * jnp.einsum("n, nij->ij", weights, deltas) - gradient[:, None] @ jnp.transpose(gradient[:, None])
-
-    #     hessian = -(self.args.temp_sample) * hessian
-    #     gradient = -(self.args.temp_sample) * gradient
-    #     # Hessian based 
-    #     hessian = 0.5 * (hessian + jnp.transpose(hessian))
-        
-    #     eigenValues, U = jnp.linalg.eigh(hessian)
-        
-    #     # jax.debug.print("Eigenvalues: {}", eigenValues)
-
-    #     eigenValues = jnp.clip(eigenValues, 1e-6, 10)
-
-    #     hessian = U @ jnp.diag(eigenValues) @ jnp.transpose(U)
-
-    #     direction = self.solve_subproblem(gradient, hessian, sigma=0.01)
-    #     direction = jnp.reshape(direction, (self.args.Hnode + 1, self.nu))
-
-    #     # jax.debug.print("Hessian direction: {}", direction)
-
-
-    #     # Gradeint descent (MPPI)
-    #     # direction = (1/self.args.temp_sample) * (noise_scale[0]**2) * jnp.reshape(gradient, (self.args.Hnode + 1, self.nu))
-    #     # jax.debug.print("GD direction: {}", direction)
-
+    #     Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
 
     #     # NOTE: update only with reward
-    #     Ybar = Ybar_i - direction
-    #     Ybar = jnp.clip(Ybar, -1, 1)
-
+    #     Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
     #     qbar = jnp.einsum("n,nij->ij", weights, qss)
     #     qdbar = jnp.einsum("n,nij->ij", weights, qdss)
     #     xbar = jnp.einsum("n,nijk->ijk", weights, xss)
@@ -217,56 +263,10 @@ class MBDPI:
     #         "qbar": qbar,
     #         "qdbar": qdbar,
     #         "xbar": xbar,
-    #         "new_noise_scale": noise_scale,
+    #         "new_noise_scale": new_noise_scale,
     #     }
 
     #     return rng, Ybar, info
-
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def reverse_once(self, state, rng, Ybar_i, noise_scale):
-        # sample from q_i
-        rng, Y0s_rng = jax.random.split(rng)
-        eps_Y = jax.random.normal(
-            Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
-        )
-        Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
-        # we can't change the first control
-        Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
-        # append Y0s with Ybar_i to also evaluate Ybar_i
-        Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
-        Y0s = jnp.clip(Y0s, -1.0, 1.0)
-        # convert Y0s to us
-        us = self.node2u_vvmap(Y0s)
-
-        # esitimate mu_0tm1
-        rewss, pipeline_statess = self.rollout_us_vmap(state, us)
-        rew_Ybar_i = rewss[-1].mean()
-        qss = pipeline_statess.q
-        qdss = pipeline_statess.qd
-        xss = pipeline_statess.x.pos
-        rews = rewss.mean(axis=-1)
-        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
-
-        # logp0 = (rews - rew_Ybar_i) / self.args.temp_sample
-        
-        weights = jax.nn.softmax(logp0)
-        Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
-
-        # NOTE: update only with reward
-        Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
-        qbar = jnp.einsum("n,nij->ij", weights, qss)
-        qdbar = jnp.einsum("n,nij->ij", weights, qdss)
-        xbar = jnp.einsum("n,nijk->ijk", weights, xss)
-
-        info = {
-            "rews": rews,
-            "qbar": qbar,
-            "qdbar": qdbar,
-            "xbar": xbar,
-            "new_noise_scale": new_noise_scale,
-        }
-
-        return rng, Ybar, info
 
     def reverse(self, state, YN, rng):
         Yi = YN
